@@ -1,75 +1,238 @@
 name: Run Scenario
 
 on:
-  push:
-    paths:
-      - 'scenario.toml'
+  workflow_dispatch:
+
+concurrency:
+  group: baby-scp-submission-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    if: github.event.repository.fork == true || github.ref != 'refs/heads/main'
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.fork == true
     permissions:
       contents: write
-      packages: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPOSE_FILE: docker-compose.yml
+      BABY_SCP_AGENT_ID: 'BABY_SCP_AGENT_ID'
+      GREEN_IMAGE: ghcr.io/zabraha/baby-scp-green@sha256:fc20c6cde8d6153a8af5ec602d071eac2c39822e35aec4f08259a611d04e22b0
+      PARTICIPANT_IMAGE: ghcr.io/onejumpinc/baby-scp-deterministic-agent@sha256:db5bde2587af8f5a9c685907ff277e3c2207fa9398e7bff2f9939869374b7459
+      CLIENT_IMAGE: ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install tomli tomli-w pyyaml requests
+        run: pip install tomli-w==1.2.0 pyyaml==6.0.3 requests==2.34.2
+
+      - name: Verify exact scenario
+        run: |
+          test ! -e .env
+          test ! -e .env.example
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import tomllib
+
+          agent_id = os.environ["BABY_SCP_AGENT_ID"]
+          if not re.fullmatch(
+              r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+              agent_id,
+          ):
+              sys.exit(f"BABY_SCP_AGENT_ID is not a lowercase UUID: {agent_id!r}")
+
+          with open("scenario.toml", "rb") as scenario_file:
+              scenario = tomllib.load(scenario_file)
+
+          expected = {
+              "green_agent": {
+                  "agentbeats_id": "019bc4d7-f7b1-7760-a5c0-f8e94f9ef122",
+                  "env": {},
+              },
+              "participants": [
+                  {
+                      "agentbeats_id": agent_id,
+                      "name": "supply_chain_planning_agent",
+                      "env": {},
+                  }
+              ],
+              "config": {},
+          }
+          if json.dumps(scenario, sort_keys=True) != json.dumps(expected, sort_keys=True):
+              sys.exit(f"scenario.toml mismatch:\n{scenario!r}")
+          print("Exact five-task Baby SCP scenario verified")
+          PY
 
       - name: Generate docker-compose.yml
-        run: python generate_compose.py --scenario scenario.toml
+        run: |
+          python generate_compose.py --scenario scenario.toml
+          test ! -e .env
+          test ! -e .env.example
+
+      - name: Pin and verify exact images
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import yaml
+
+          with open("docker-compose.yml") as compose_file:
+              compose = yaml.safe_load(compose_file)
+
+          participant_name = "supply_chain_planning_agent"
+          expected_without_images = {
+              "green-agent": {
+                  "platform": "linux/amd64",
+                  "container_name": "green-agent",
+                  "command": [
+                      "--host",
+                      "0.0.0.0",
+                      "--port",
+                      "9009",
+                      "--card-url",
+                      "http://green-agent:9009",
+                  ],
+                  "environment": ["PYTHONUNBUFFERED=1"],
+                  "healthcheck": {
+                      "test": [
+                          "CMD",
+                          "curl",
+                          "-f",
+                          "http://localhost:9009/.well-known/agent-card.json",
+                      ],
+                      "interval": "5s",
+                      "timeout": "3s",
+                      "retries": 10,
+                      "start_period": "30s",
+                  },
+                  "depends_on": {
+                      participant_name: {"condition": "service_healthy"}
+                  },
+                  "networks": ["agent-network"],
+              },
+              participant_name: {
+                  "platform": "linux/amd64",
+                  "container_name": participant_name,
+                  "command": [
+                      "--host",
+                      "0.0.0.0",
+                      "--port",
+                      "9009",
+                      "--card-url",
+                      f"http://{participant_name}:9009",
+                  ],
+                  "environment": ["PYTHONUNBUFFERED=1"],
+                  "healthcheck": {
+                      "test": [
+                          "CMD",
+                          "curl",
+                          "-f",
+                          "http://localhost:9009/.well-known/agent-card.json",
+                      ],
+                      "interval": "5s",
+                      "timeout": "3s",
+                      "retries": 10,
+                      "start_period": "30s",
+                  },
+                  "networks": ["agent-network"],
+              },
+              "agentbeats-client": {
+                  "platform": "linux/amd64",
+                  "container_name": "agentbeats-client",
+                  "volumes": [
+                      "./a2a-scenario.toml:/app/scenario.toml",
+                      "./output:/app/output",
+                  ],
+                  "command": ["scenario.toml", "output/results.json"],
+                  "depends_on": {
+                      "green-agent": {"condition": "service_healthy"},
+                      participant_name: {"condition": "service_healthy"},
+                  },
+                  "networks": ["agent-network"],
+              },
+          }
+          if set(compose) != {"services", "networks"}:
+              sys.exit(f"Unexpected top-level Compose keys: {sorted(compose)}")
+          if compose["networks"] != {"agent-network": {"driver": "bridge"}}:
+              sys.exit(f"Unexpected Compose networks: {compose['networks']!r}")
+          if set(compose["services"]) != set(expected_without_images):
+              sys.exit(f"Unexpected Compose services: {sorted(compose['services'])}")
+          for service_name, expected_service in expected_without_images.items():
+              service = compose["services"][service_name]
+              actual_without_image = {
+                  key: value for key, value in service.items() if key != "image"
+              }
+              if actual_without_image != expected_service:
+                  sys.exit(
+                      f"Unexpected {service_name} service configuration: "
+                      f"{actual_without_image!r}"
+                  )
+
+          expected_unpinned_images = {
+              "green-agent": "ghcr.io/zabraha/baby-scp-green:latest",
+              participant_name: os.environ["PARTICIPANT_IMAGE"],
+              "agentbeats-client": "ghcr.io/agentbeats/agentbeats-client:v1.0.0",
+          }
+          actual_unpinned_images = {
+              name: service["image"]
+              for name, service in compose["services"].items()
+          }
+          if actual_unpinned_images != expected_unpinned_images:
+              sys.exit(
+                  "Unexpected API/generated image references: "
+                  f"{actual_unpinned_images!r}"
+              )
+
+          registered_image = compose["services"][participant_name]["image"]
+          if registered_image != os.environ["PARTICIPANT_IMAGE"]:
+              sys.exit(
+                  "Baby SCP registration resolved to "
+                  f"{registered_image!r}, expected {os.environ['PARTICIPANT_IMAGE']!r}"
+              )
+
+          compose["services"]["green-agent"]["image"] = os.environ["GREEN_IMAGE"]
+          compose["services"]["agentbeats-client"]["image"] = os.environ[
+              "CLIENT_IMAGE"
+          ]
+          with open("docker-compose.yml", "w") as compose_file:
+              yaml.safe_dump(compose, compose_file, sort_keys=False)
+          PY
+
+          docker compose config --format json | jq -e \
+            --arg green "$GREEN_IMAGE" \
+            --arg participant "$PARTICIPANT_IMAGE" \
+            --arg client "$CLIENT_IMAGE" '
+              (.services | keys) == [
+                "agentbeats-client",
+                "green-agent",
+                "supply_chain_planning_agent"
+              ]
+              and .services["green-agent"].image == $green
+              and .services["supply_chain_planning_agent"].image == $participant
+              and .services["agentbeats-client"].image == $client
+              and ([.services[] | select(has("build"))] | length) == 0
+            ' >/dev/null
 
       - name: Pull images
-        run: |
-          if ! docker compose pull; then
-            echo ""
-            echo "Error: Failed to pull one or more images."
-            echo "Ensure all images are publicly accessible."
-            echo "For ghcr.io images, check package settings at:"
-            echo "  https://github.com/orgs/YOUR_ORG/packages or"
-            echo "  https://github.com/users/YOUR_USER/packages"
-            exit 1
-          fi
+        run: docker compose pull
 
-      - name: Create output directory
-        run: mkdir -p output && chmod 777 output
-
-      - name: Export secrets as environment variables
-        env:
-          SECRETS_JSON: ${{ toJSON(secrets) }}
-        run: |
-          echo "$SECRETS_JSON" | jq -r 'to_entries|map("\(.key)=\(.value)")|.[]' > .env
-
-      - name: Check if GHCR_TOKEN is available
-        id: check_ghcr
-        env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        run: |
-          if [ -n "$GHCR_TOKEN" ]; then
-            echo "has_token=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_token=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Login to GitHub Container Registry
-        if: steps.check_ghcr.outputs.has_token == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
-
-      - name: Debug .env
-        run: cat .env  # Shows: GEMINI_API_KEY=ghp_xxx
+      - name: Create empty output directory
+        run: rm -rf output && mkdir -p output && chmod 777 output
 
       - name: Run assessment
         run: docker compose up --timestamps --no-color --exit-code-from agentbeats-client --abort-on-container-exit
@@ -77,53 +240,188 @@ jobs:
       - name: Record provenance
         run: python record_provenance.py --compose docker-compose.yml --output output/provenance.json
 
+      - name: Verify exact score and provenance
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import re
+          import sys
+
+          def fail(message):
+              sys.exit(f"Gate failed: {message}")
+
+          def is_number(value):
+              return type(value) in (int, float)
+
+          with open("output/results.json") as results_file:
+              results = json.load(
+                  results_file,
+                  parse_constant=lambda constant: fail(
+                      f"non-finite result number {constant}"
+                  ),
+              )
+
+          if not isinstance(results, dict) or set(results) != {
+              "participants",
+              "results",
+          }:
+              fail(f"unexpected result keys={sorted(results)}")
+          expected_participants = {
+              "supply_chain_planning_agent": os.environ["BABY_SCP_AGENT_ID"]
+          }
+          if results.get("participants") != expected_participants:
+              fail(f"participants={results.get('participants')!r}")
+
+          runs = results.get("results")
+          if not isinstance(runs, list) or len(runs) != 1:
+              fail("expected exactly one benchmark result")
+          run = runs[0]
+          if not isinstance(run, dict) or set(run) != {
+              "pass_rate",
+              "total_tasks",
+              "results",
+          }:
+              fail(f"unexpected benchmark result={run!r}")
+          if not is_number(run.get("pass_rate")) or run["pass_rate"] != 1:
+              fail(f"pass_rate={run.get('pass_rate')!r}, expected 1")
+          if type(run.get("total_tasks")) is not int or run["total_tasks"] != 5:
+              fail(f"total_tasks={run.get('total_tasks')!r}, expected 5")
+
+          task_results = run.get("results")
+          if not isinstance(task_results, list) or len(task_results) != 5:
+              fail(f"expected exactly five task results: {task_results!r}")
+          task_ids = []
+          for task_result in task_results:
+              if not isinstance(task_result, dict) or set(task_result) != {
+                  "task_id",
+                  "success",
+                  "latency",
+              }:
+                  fail(f"unexpected task result={task_result!r}")
+              task_id = task_result["task_id"]
+              if not isinstance(task_id, str):
+                  fail(f"invalid task_id={task_id!r}")
+              task_ids.append(task_id)
+              if task_result["success"] is not True:
+                  fail(f"task {task_result['task_id']!r} did not pass")
+              latency = task_result["latency"]
+              if not is_number(latency) or not math.isfinite(latency) or latency < 0:
+                  fail(f"invalid latency for {task_result['task_id']!r}: {latency!r}")
+          if sorted(task_ids) != ["p1", "p2", "p3", "p4", "p5"]:
+              fail(f"task_ids={task_ids!r}")
+
+          with open("output/provenance.json") as provenance_file:
+              provenance = json.load(
+                  provenance_file,
+                  parse_constant=lambda constant: fail(
+                      f"non-finite provenance number {constant}"
+                  ),
+              )
+          if not isinstance(provenance, dict) or set(provenance) != {
+              "image_digests",
+              "timestamp",
+              "github_actions",
+          }:
+              fail(f"unexpected provenance={provenance!r}")
+          timestamp = provenance["timestamp"]
+          if not isinstance(timestamp, str) or not re.fullmatch(
+              r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", timestamp
+          ):
+              fail(f"invalid provenance timestamp={timestamp!r}")
+          expected_digests = {
+              "green-agent": os.environ["GREEN_IMAGE"],
+              "supply_chain_planning_agent": os.environ["PARTICIPANT_IMAGE"],
+              "agentbeats-client": os.environ["CLIENT_IMAGE"],
+          }
+          if provenance.get("image_digests") != expected_digests:
+              fail(
+                  "provenance image_digests="
+                  f"{provenance.get('image_digests')!r}"
+              )
+
+          expected_actions = {
+              "run_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              ),
+              "run_logs_url": (
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}/logs"
+              ),
+              "ref": os.environ["GITHUB_REF"],
+              "sha": os.environ["GITHUB_SHA"],
+              "repository_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+              ),
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+          }
+          if provenance.get("github_actions") != expected_actions:
+              fail(f"github_actions={provenance.get('github_actions')!r}")
+
+          print("Exact 5/5 score and immutable provenance verified")
+          PY
+
       - name: Generate submission metadata
         id: metadata
         run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          USERNAME=${{ github.repository_owner }}
-          UNIQUE_NAME="${USERNAME}-${TIMESTAMP}"
-          echo "unique_name=$UNIQUE_NAME" >> $GITHUB_OUTPUT
-          echo "branch_name=submission-${UNIQUE_NAME}" >> $GITHUB_OUTPUT
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          username='${{ github.repository_owner }}'
+          unique_name="${username}-${timestamp}"
+          {
+            echo "unique_name=${unique_name}"
+            echo "branch_name=submission-${unique_name}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Copy files to submission directory
         run: |
-          cp scenario.toml submissions/${{ steps.metadata.outputs.unique_name }}.toml
-          cp output/results.json results/${{ steps.metadata.outputs.unique_name }}.json
-          cp output/provenance.json submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json
+          cp scenario.toml "submissions/${{ steps.metadata.outputs.unique_name }}.toml"
+          cp output/results.json "results/${{ steps.metadata.outputs.unique_name }}.json"
+          cp output/provenance.json "submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json"
 
       - name: Determine target repository
         id: target
         env:
-            GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-            PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // "${{ github.repository }}"')
-            echo "Target repository: $PARENT_REPO"
-            echo "repo=$PARENT_REPO" >> $GITHUB_OUTPUT
+          parent_repo=$(gh api "repos/${{ github.repository }}" \
+            --jq '.parent.full_name // "${{ github.repository }}"')
+          echo "Target repository: ${parent_repo}"
+          echo "repo=${parent_repo}" >> "$GITHUB_OUTPUT"
 
       - name: Create submission branch
         run: |
-          git remote add upstream https://github.com/${{ steps.target.outputs.repo }}.git
+          git remote add upstream "https://github.com/${{ steps.target.outputs.repo }}.git"
           git fetch upstream
-          git checkout -b ${{ steps.metadata.outputs.branch_name }} upstream/main
+          git checkout -b "${{ steps.metadata.outputs.branch_name }}" upstream/main
 
       - name: Commit results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: '!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
+          git add \
+            "submissions/${{ steps.metadata.outputs.unique_name }}.toml" \
+            "submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json" \
+            "results/${{ steps.metadata.outputs.unique_name }}.json"
           git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
 
           Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          git push origin ${{ steps.metadata.outputs.branch_name }}
+          git push origin "${{ steps.metadata.outputs.branch_name }}"
           echo "::notice title=Submission Branch Created::Your results are ready for submission on branch: ${{ steps.metadata.outputs.branch_name }}"
 
       - name: Output PR link
         run: |
-          echo "### Submit your results" >> $GITHUB_STEP_SUMMARY
-          echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Submit your results"
+            echo "[Open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
         if: always()

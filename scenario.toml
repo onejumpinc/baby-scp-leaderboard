@@ -3,15 +3,8 @@ agentbeats_id = "019bc4d7-f7b1-7760-a5c0-f8e94f9ef122"
 env = {}
 
 [[participants]]
-agentbeats_id = "019bc4dd-7e76-75f1-be6b-1810ee3986f1"
+agentbeats_id = "BABY_SCP_AGENT_ID"
 name = "supply_chain_planning_agent"
-environment = [
-    "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
-]
-
-# Optional: also create .env file in container
-env_file = ".env"
-#env = {GEMINI_API_KEY = "${GEMINI_API_KEY}"} 
+env = {}
 
 [config]
-# Add your assessment config here
