@@ -22,6 +22,8 @@ jobs:
       BABY_SCP_AGENT_ID: 'BABY_SCP_AGENT_ID'
       GREEN_IMAGE: ghcr.io/zabraha/baby-scp-green@sha256:fc20c6cde8d6153a8af5ec602d071eac2c39822e35aec4f08259a611d04e22b0
       PARTICIPANT_IMAGE: ghcr.io/onejumpinc/baby-scp-deterministic-agent@sha256:db5bde2587af8f5a9c685907ff277e3c2207fa9398e7bff2f9939869374b7459
+      PARTICIPANT_MANIFEST_URL: https://raw.githubusercontent.com/onejumpinc/baby-scp-deterministic-agent/647496455c0cf2cc187a8c4078286825861d2409/amber-manifest.json5
+      PARTICIPANT_MANIFEST_SHA256: 255d0674090d396e38cbc23be1ad53cb4d15d18fa6a8dfeefff18ba446127faf
       CLIENT_IMAGE: ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e
 
     steps:
@@ -46,15 +48,19 @@ jobs:
           import json
           import os
           import re
+          import requests
           import sys
           import tomllib
+
+          def fail(message):
+              sys.exit(f"Gate failed: {message}")
 
           agent_id = os.environ["BABY_SCP_AGENT_ID"]
           if not re.fullmatch(
               r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
               agent_id,
           ):
-              sys.exit(f"BABY_SCP_AGENT_ID is not a lowercase UUID: {agent_id!r}")
+              fail(f"BABY_SCP_AGENT_ID is not a lowercase UUID: {agent_id!r}")
 
           with open("scenario.toml", "rb") as scenario_file:
               scenario = tomllib.load(scenario_file)
@@ -74,9 +80,48 @@ jobs:
               "config": {},
           }
           if json.dumps(scenario, sort_keys=True) != json.dumps(expected, sort_keys=True):
-              sys.exit(f"scenario.toml mismatch:\n{scenario!r}")
-          print("Exact five-task Baby SCP scenario verified")
+              fail(f"scenario.toml mismatch:\n{scenario!r}")
+
+          response = requests.get(
+              f"https://agentbeats.dev/api/agents/{agent_id}",
+              headers={
+                  "User-Agent": (
+                      "baby-scp-leaderboard/1.0 "
+                      "(+https://github.com/onejumpinc/baby-scp-leaderboard)"
+                  )
+              },
+              timeout=30,
+          )
+          response.raise_for_status()
+          registered = response.json()
+          if registered.get("id") != agent_id:
+              fail(f"registration id={registered.get('id')!r}")
+          if registered.get("creator_name") != "onejumpinc":
+              fail(f"registration creator={registered.get('creator_name')!r}")
+          if registered.get("color") != "purple":
+              fail(f"registration color={registered.get('color')!r}")
+          locator = (
+              registered.get("docker_image"),
+              registered.get("amber_manifest_url"),
+          )
+          allowed = {
+              (os.environ["PARTICIPANT_IMAGE"], None),
+              (None, os.environ["PARTICIPANT_MANIFEST_URL"]),
+              (
+                  os.environ["PARTICIPANT_IMAGE"],
+                  os.environ["PARTICIPANT_MANIFEST_URL"],
+              ),
+          }
+          if locator not in allowed:
+              fail(f"unexpected registration locator={locator!r}")
+          print("Exact five-task Baby SCP scenario and registration verified")
           PY
+
+          manifest_path="$RUNNER_TEMP/baby-scp-participant-manifest.json5"
+          curl --fail --silent --show-error --location \
+            --output "$manifest_path" "$PARTICIPANT_MANIFEST_URL"
+          printf '%s  %s\n' "$PARTICIPANT_MANIFEST_SHA256" "$manifest_path" \
+            | sha256sum --check --strict
 
       - name: Generate docker-compose.yml
         run: |
@@ -89,12 +134,29 @@ jobs:
           python - <<'PY'
           import os
           import sys
+          import tomllib
           import yaml
 
           with open("docker-compose.yml") as compose_file:
               compose = yaml.safe_load(compose_file)
+          with open("a2a-scenario.toml", "rb") as scenario_file:
+              a2a_scenario = tomllib.load(scenario_file)
 
           participant_name = "supply_chain_planning_agent"
+          expected_a2a = {
+              "green_agent": {"endpoint": "http://green-agent:9009"},
+              "participants": [
+                  {
+                      "role": participant_name,
+                      "endpoint": f"http://{participant_name}:9009",
+                      "agentbeats_id": os.environ["BABY_SCP_AGENT_ID"],
+                  }
+              ],
+              "config": {},
+          }
+          if a2a_scenario != expected_a2a:
+              sys.exit(f"Unexpected a2a-scenario.toml: {a2a_scenario!r}")
+
           expected_without_images = {
               "green-agent": {
                   "platform": "linux/amd64",
@@ -183,29 +245,38 @@ jobs:
                       f"{actual_without_image!r}"
                   )
 
-          expected_unpinned_images = {
-              "green-agent": "ghcr.io/zabraha/baby-scp-green:latest",
-              participant_name: os.environ["PARTICIPANT_IMAGE"],
-              "agentbeats-client": "ghcr.io/agentbeats/agentbeats-client:v1.0.0",
-          }
           actual_unpinned_images = {
-              name: service["image"]
+              name: service.get("image")
               for name, service in compose["services"].items()
           }
-          if actual_unpinned_images != expected_unpinned_images:
+          if actual_unpinned_images["green-agent"] != (
+              "ghcr.io/zabraha/baby-scp-green:latest"
+          ):
               sys.exit(
-                  "Unexpected API/generated image references: "
-                  f"{actual_unpinned_images!r}"
+                  "Unexpected green API image: "
+                  f"{actual_unpinned_images['green-agent']!r}"
               )
-
-          registered_image = compose["services"][participant_name]["image"]
-          if registered_image != os.environ["PARTICIPANT_IMAGE"]:
+          if actual_unpinned_images["agentbeats-client"] != (
+              "ghcr.io/agentbeats/agentbeats-client:v1.0.0"
+          ):
               sys.exit(
-                  "Baby SCP registration resolved to "
-                  f"{registered_image!r}, expected {os.environ['PARTICIPANT_IMAGE']!r}"
+                  "Unexpected client image: "
+                  f"{actual_unpinned_images['agentbeats-client']!r}"
+              )
+          if actual_unpinned_images[participant_name] not in {
+              os.environ["PARTICIPANT_IMAGE"],
+              "None",
+              None,
+          }:
+              sys.exit(
+                  "Unexpected participant API image: "
+                  f"{actual_unpinned_images[participant_name]!r}"
               )
 
           compose["services"]["green-agent"]["image"] = os.environ["GREEN_IMAGE"]
+          compose["services"][participant_name]["image"] = os.environ[
+              "PARTICIPANT_IMAGE"
+          ]
           compose["services"]["agentbeats-client"]["image"] = os.environ[
               "CLIENT_IMAGE"
           ]
@@ -309,7 +380,7 @@ jobs:
               latency = task_result["latency"]
               if not is_number(latency) or not math.isfinite(latency) or latency < 0:
                   fail(f"invalid latency for {task_result['task_id']!r}: {latency!r}")
-          if sorted(task_ids) != ["p1", "p2", "p3", "p4", "p5"]:
+          if task_ids != ["p1", "p2", "p3", "p4", "p5"]:
               fail(f"task_ids={task_ids!r}")
 
           with open("output/provenance.json") as provenance_file:

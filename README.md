@@ -1,30 +1,40 @@
-# Baby Supply Chain Planning Benchmark Leaderboard
-This repository hosts the leaderboard for the Baby Supply Chain Planning Benchmark green agent.
+# Baby Supply Chain Planning submission runner
 
-This benchmark assesses agents to generate feasible plans for simple supply  chain planning problems.
-This is a baby benchmark with about 6 basic problems. The assessee will get a natural language prompt for each problem and is expected to respond back in json using the schema provided in the prompt. No tools are provided. Here is how the prompt looks like
+This public fork is prepared for a reproducible submission by
+[`onejumpinc/baby-scp-deterministic-agent`](https://github.com/onejumpinc/baby-scp-deterministic-agent).
+It does not run on pushes. The workflow is manual-only and intentionally remains
+non-runnable until the participant has a real AgentBeats UUID.
 
-## Typical prompt for an assessment problem
+The participant release passed 200/200 scored public tasks across 40 live A2A
+evaluations, two routes, and two fresh container pairs in
+[`Run 35666304510`](https://github.com/onejumpinc/baby-scp-deterministic-agent/actions/runs/35666304510).
+The exact public image is:
 
-The supply chain planning problem is represented as a property graph using nodes, edges and demands using the following json schema
+```text
+ghcr.io/onejumpinc/baby-scp-deterministic-agent@sha256:db5bde2587af8f5a9c685907ff277e3c2207fa9398e7bff2f9939869374b7459
+```
 
-{scp-problem-schema}
+This release validation is not represented as an official AgentBeats score.
+Only a completed green-agent run can produce a leaderboard submission.
 
-If there are no edges like in the case of single item supply chains the edges will be an empty array.  
-Lead time is in days and time buckets are days from the start of the planning horizon. 
-Generate a feasible just in time plan.
-Minimize the lateness when you have to delay a demand due to constraints. 
-A separate planned order is needed for each substitute component or each alternate resource.
-Respond ONLY with JSON.
-Ouput the solution in the following json schema
+## Benchmark and exact gate
 
-{scp-solution-schema}
+The green agent sends five public supply-chain problems (`p1` through `p5`). A
+participant must return the expected JSON plan for each problem. The workflow
+creates a submission branch only when all five task results pass, the reported
+pass rate is exactly 1.0, the task order and result schemas are exact, all three
+container images match immutable digests, and GitHub Actions provenance matches
+the running workflow.
 
-Problem:
+Any missing prerequisite, registration mismatch, topology drift, partial result,
+failed task, non-finite value, mutable image, or provenance mismatch stops the
+workflow before a submission branch is created.
 
-{problem}
+## Remaining prerequisites
 
-## Evaluation
-
-The response is checked against the expected solution and a pass is given if they match.
-The pass-rate as a percentage is reported as the overall performance.
+1. Register the participant on AgentBeats with this immutable manifest:
+   `https://raw.githubusercontent.com/onejumpinc/baby-scp-deterministic-agent/647496455c0cf2cc187a8c4078286825861d2409/amber-manifest.json5`.
+2. Replace `BABY_SCP_AGENT_ID` in both `scenario.toml` and the workflow with the
+   returned lowercase UUID.
+3. Manually dispatch **Run Scenario**. If and only if the exact 5/5 gate passes,
+   use the generated comparison link to open the upstream pull request.
